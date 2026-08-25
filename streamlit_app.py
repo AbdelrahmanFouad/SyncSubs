@@ -79,7 +79,7 @@ def parse_srt(content):
     return parsed_entries
 
 
-def format_report(report_data):
+def format_report(report_data, missing_details):
     """Format the detailed report like the original script."""
     lines = []
     lines.append("")
@@ -94,7 +94,7 @@ def format_report(report_data):
         filename = file_info['filename']
         matched = file_info['matched']
         total = file_info['total']
-        missing = file_info['missing']
+        missing_count = file_info['missing']
         total_matched += matched
         total_entries += total
 
@@ -102,9 +102,9 @@ def format_report(report_data):
         lines.append(f"Summary: {matched} matched / {total} total.")
         lines.append("")
 
-        if missing:
+        if missing_details[filename]:
             lines.append("Missing Entries:")
-            for m in missing:
+            for m in missing_details[filename]:
                 clean_text = m['text'].replace('\n', ' ')
                 lines.append(f"  #{m['index']} [{m['timestamp']}] English: {clean_text}")
         else:
@@ -187,6 +187,7 @@ def main():
         with st.spinner("Syncing English files..."):
             report_data = []
             synced_files = {}
+            missing_details = {}
 
             for ef in english_files:
                 e_content = read_file_safely(ef)
@@ -218,9 +219,11 @@ def main():
                     'filename': ef.name,
                     'total': len(e_entries),
                     'matched': match_count,
-                    'missing': missing_entries,
+                    'missing': len(missing_entries),
                     'match_rate': f"{(match_count / len(e_entries) * 100):.1f}%" if e_entries else "0%",
                 })
+
+                missing_details[ef.name] = missing_entries
 
             st.success("Syncing complete!")
 
@@ -237,8 +240,25 @@ def main():
             f"{total_matched}/{total_entries} entries",
         )
 
-        # Download synced files
+        # Download all synced files
         st.header("Download Synced Files")
+        if len(synced_files) > 1:
+            import zipfile
+            # Create zip file in memory
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for filename, content in synced_files.items():
+                    zip_file.writestr(filename, content.encode('utf-8-sig'))
+            zip_buffer.seek(0)
+            st.download_button(
+                label=f"📦 Download All Synced Files ({len(synced_files)} files) ZIP",
+                data=zip_buffer,
+                file_name="all_synced_files.zip",
+                mime="application/zip",
+                key="download_all",
+            )
+            st.info(f"Found {len(synced_files)} synced files. You can download individual files above, or the ZIP file containing all files.")
+
         for filename, content in synced_files.items():
             b64 = content.encode('utf-8-sig')
             st.download_button(
@@ -250,7 +270,7 @@ def main():
             )
 
         # Download detailed report
-        report_text = format_report(report_data)
+        report_text = format_report(report_data, missing_details)
         b64_report = report_text.encode('utf-8')
         st.download_button(
             label="📄 Download Detailed Report",
@@ -261,7 +281,8 @@ def main():
         )
 
         # Show files with missing translations
-        missing_df = df[df['missing'] > 0]
+        missing_mask = df['missing'].apply(lambda x: isinstance(x, int) and x > 0)
+        missing_df = df[missing_mask]
         if not missing_df.empty:
             st.header("Files with Missing Translations")
             for _, row in missing_df.iterrows():
@@ -271,7 +292,7 @@ def main():
                         "that could not be matched against the translated map."
                     )
 
-    elif st.button("Sync Subtitles", type="primary"):
+    else:
         st.warning("Please upload both translated AND English .srt files.")
 
 
