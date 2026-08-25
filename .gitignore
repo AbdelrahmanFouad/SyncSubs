@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output directories
+done/
+english/
+transalted/
+__pycache__/
+
+# Log files
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
