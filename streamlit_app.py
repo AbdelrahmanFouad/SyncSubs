@@ -1,8 +1,11 @@
 import os
 import re
 import io
+import difflib
 import chardet
 import unicodedata
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 
@@ -35,9 +38,14 @@ def normalize_text(text):
     return text
 
 
+_ARABIC_RE = re.compile(
+    r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]'
+)
+
+
 def is_arabic(text):
-    """Check if text contains Arabic characters."""
-    return bool(re.search(r'[\u0600-\u06FF]', text))
+    """Check if text contains Arabic characters (full block + extended + forms)."""
+    return bool(_ARABIC_RE.search(text))
 
 
 def read_file_safely(uploaded_file):
@@ -79,8 +87,100 @@ def parse_srt(content):
     return parsed_entries
 
 
+def split_entry(entry):
+    """Split a block's text into (arabic_lines, english_lines)."""
+    lines = entry['text'].split('\n')
+    arabic_lines = [l.strip() for l in lines if is_arabic(l)]
+    english_lines = [l.strip() for l in lines if not is_arabic(l)]
+    return arabic_lines, english_lines
+
+
+def pair_files(translated_files, english_files):
+    """Pair each English file to its own translated file.
+
+    Order: exact filename -> closest stem (difflib) -> sole translated file.
+    Returns {english_filename: translated_UploadedFile} (missing keys = unpaired).
+    """
+    t_by_name = {tf.name: tf for tf in translated_files}
+    t_names = list(t_by_name.keys())
+    pairs = {}
+
+    for ef in english_files:
+        if ef.name in t_by_name:
+            pairs[ef.name] = t_by_name[ef.name]
+            continue
+        stem = Path(ef.name).stem.lower()
+        best_name, best_score = None, 0.0
+        for tn in t_names:
+            score = difflib.SequenceMatcher(
+                a=stem, b=Path(tn).stem.lower()).ratio()
+            if score > best_score:
+                best_name, best_score = tn, score
+        if best_name and best_score >= 0.5:
+            pairs[ef.name] = t_by_name[best_name]
+        elif len(t_names) == 1:
+            # exactly one translated file -> it's the obvious source
+            pairs[ef.name] = t_by_name[t_names[0]]
+    return pairs
+
+
+def sync_pair(t_entries, e_entries):
+    """Sync English entries against their PAIRED translated entries.
+
+    Pass 1 (positional): difflib sequence-alignment — an unchanged line carries
+        its Arabic straight over, anchored by position. Survives insertions,
+        deletions and re-ordering in a re-edited reel.
+    Pass 2 (text, order-aware): any remaining English line is looked up against
+        the still-unused translated lines (a list per normalized key, consumed
+        in order, so repeated "Hey!"s map to their translations in sequence).
+
+    Returns {e_index: (arabic_or_None, provenance)} where provenance is
+    'position', 'text' or 'missing'.
+    """
+    t_pairs = []  # (norm_english, arabic)
+    for e in t_entries:
+        ar, en = split_entry(e)
+        if ar and en:
+            t_pairs.append((normalize_text('\n'.join(en)), '\n'.join(ar)))
+
+    t_keys = [p[0] for p in t_pairs]
+    e_keys = [normalize_text(e['text']) for e in e_entries]
+
+    result = {}
+    used_t = set()
+
+    # Pass 1 — positional alignment
+    if t_keys and e_keys:
+        sm = difflib.SequenceMatcher(a=t_keys, b=e_keys, autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == 'equal':
+                for off in range(j2 - j1):
+                    result[j1 + off] = (t_pairs[i1 + off][1], 'position')
+                    used_t.add(i1 + off)
+
+    # Pass 2 — order-aware text fallback from the remaining translated lines
+    text_map = {}
+    for i, (norm, ar) in enumerate(t_pairs):
+        if i not in used_t:
+            text_map.setdefault(norm, []).append(ar)
+    used = {k: 0 for k in text_map}
+
+    for j in range(len(e_entries)):
+        if j in result:
+            continue
+        k = e_keys[j]
+        bucket = text_map.get(k)
+        if bucket and used[k] < len(bucket):
+            result[j] = (bucket[used[k]], 'text')
+            used[k] += 1
+        else:
+            result[j] = (None, 'missing')
+
+    return result
+
+
 def format_report(report_data, missing_details):
-    """Format the detailed report like the original script."""
+    """Format the detailed report."""
     lines = []
     lines.append("")
     lines.append(" " * 30 + "DETAILED MISSING TRANSLATIONS REPORT")
@@ -92,14 +192,11 @@ def format_report(report_data, missing_details):
 
     for file_info in report_data:
         filename = file_info['filename']
-        matched = file_info['matched']
-        total = file_info['total']
-        missing_count = file_info['missing']
-        total_matched += matched
-        total_entries += total
-
         lines.append(f"FILE: {filename}")
-        lines.append(f"Summary: {matched} matched / {total} total.")
+        lines.append(
+            f"Summary: {file_info['matched']} matched "
+            f"({file_info['position']} by position, {file_info['text']} by text) "
+            f"/ {file_info['total']} total.")
         lines.append("")
 
         if missing_details[filename]:
@@ -123,26 +220,26 @@ def format_report(report_data, missing_details):
 def main():
     st.title("SRT Subtitle Sync Tool")
     st.markdown(
-        "Synchronize English subtitles with Arabic translations. "
-        "Upload translated files to build a global map, then upload English "
-        "files to produce synced bilingual subtitles."
+        "Carry your existing Arabic translations onto a new English cut. "
+        "Each English file is paired to its own translated file (by name), "
+        "matched by position first, then by text."
     )
 
     with st.sidebar:
         st.header("Instructions")
         st.markdown(
-            "1. **Upload translated (.srt files)** - These should contain both "
-            "Arabic and English text to build the translation map.\n\n"
-            "2. **Upload English (.srt files)** - These will have Arabic lines "
-            "prepended where a match is found in the translation map.\n\n"
-            "3. Click **Sync Subtitles** to process and generate output files.\n\n"
-            "4. Download synced files and detailed report."
+            "1. **Upload translated (.srt files)** — bilingual files "
+            "(Arabic + English) you translated before.\n\n"
+            "2. **Upload English (.srt files)** — the new/re-edited cut.\n\n"
+            "3. Click **Sync Subtitles**.\n\n"
+            "4. Download the synced bilingual files and the report."
         )
         st.divider()
-        st.caption("Built with Streamlit")
+        st.caption("Matching is per-file, position-first, then text. "
+                   "No cross-file leakage.")
 
     st.header("Step 1: Upload Translated (Arabic) Files")
-    st.caption("These files contain both Arabic and English text; they build the translation map.")
+    st.caption("Bilingual files (Arabic + English) that supply the translations.")
     translated_files = st.file_uploader(
         "Upload translated .srt file(s)",
         type=["srt"],
@@ -152,7 +249,7 @@ def main():
     )
 
     st.header("Step 2: Upload English Files")
-    st.caption("These files will have Arabic lines prepended where a match is found.")
+    st.caption("The new English-only cut that will receive the Arabic lines.")
     english_files = st.file_uploader(
         "Upload English .srt file(s)",
         type=["srt"],
@@ -164,44 +261,38 @@ def main():
     st.divider()
 
     if st.button("Sync Subtitles", type="primary", key="sync_button") and translated_files and english_files:
-        # Build translation map
-        with st.spinner("Building translation map..."):
-            trans_map = {}
-            for tf in translated_files:
-                content = read_file_safely(tf)
-                entries = parse_srt(content)
-                for entry in entries:
-                    lines = entry['text'].split('\n')
-                    arabic_lines = [l.strip() for l in lines if is_arabic(l)]
-                    english_lines = [l.strip() for l in lines if not is_arabic(l)]
-                    if arabic_lines and english_lines:
-                        arabic_text = '\n'.join(arabic_lines)
-                        english_text = '\n'.join(english_lines)
-                        norm_eng = normalize_text(english_text)
-                        if norm_eng and norm_eng not in trans_map:
-                            trans_map[norm_eng] = arabic_text
+        pairs = pair_files(translated_files, english_files)
 
-            st.success(f"Translation map built: **{len(trans_map)}** entries")
+        report_data = []
+        synced_files = {}
+        missing_details = {}
 
-        # Sync English files
-        with st.spinner("Syncing English files..."):
-            report_data = []
-            synced_files = {}
-            missing_details = {}
-
+        with st.spinner("Syncing..."):
             for ef in english_files:
-                e_content = read_file_safely(ef)
-                e_entries = parse_srt(e_content)
+                paired_tf = pairs.get(ef.name)
+                e_entries = parse_srt(read_file_safely(ef))
+                t_entries = parse_srt(read_file_safely(paired_tf)) if paired_tf else []
+
+                if not paired_tf:
+                    st.warning(
+                        f"No translated file matched **{ef.name}** — "
+                        "leaving all its entries untranslated."
+                    )
+
+                result = sync_pair(t_entries, e_entries)
 
                 new_srt_entries = []
                 missing_entries = []
+                n_pos = n_text = 0
 
-                for entry in e_entries:
-                    norm_eng = normalize_text(entry['text'])
-                    arabic = trans_map.get(norm_eng)
-
+                for j, entry in enumerate(e_entries):
+                    arabic, prov = result.get(j, (None, 'missing'))
                     if arabic:
                         combined_text = f"{arabic}\n{entry['text']}"
+                        if prov == 'position':
+                            n_pos += 1
+                        else:
+                            n_text += 1
                     else:
                         combined_text = entry['text']
                         missing_entries.append(entry)
@@ -214,20 +305,21 @@ def main():
                 output_filename = f"synced_{ef.name}"
                 synced_files[output_filename] = output_content
 
-                match_count = len(e_entries) - len(missing_entries)
+                matched = n_pos + n_text
                 report_data.append({
                     'filename': ef.name,
                     'total': len(e_entries),
-                    'matched': match_count,
+                    'position': n_pos,
+                    'text': n_text,
+                    'matched': matched,
                     'missing': len(missing_entries),
-                    'match_rate': f"{(match_count / len(e_entries) * 100):.1f}%" if e_entries else "0%",
+                    'match_rate': f"{(matched / len(e_entries) * 100):.1f}%" if e_entries else "0%",
                 })
-
                 missing_details[ef.name] = missing_entries
 
-            st.success("Syncing complete!")
+        st.success("Syncing complete!")
 
-        # Display results
+        # Results
         st.header("Results")
         df = pd.DataFrame(report_data)
         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -244,7 +336,6 @@ def main():
         st.header("Download Synced Files")
         if len(synced_files) > 1:
             import zipfile
-            # Create zip file in memory
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
                 for filename, content in synced_files.items():
@@ -257,30 +348,27 @@ def main():
                 mime="application/zip",
                 key="download_all",
             )
-            st.info(f"Found {len(synced_files)} synced files. You can download individual files above, or the ZIP file containing all files.")
 
         for filename, content in synced_files.items():
-            b64 = content.encode('utf-8-sig')
             st.download_button(
                 label=f"Download {filename}",
-                data=b64,
+                data=content.encode('utf-8-sig'),
                 file_name=filename,
                 mime="application/x-subrip",
                 key=filename,
             )
 
-        # Download detailed report
+        # Detailed report
         report_text = format_report(report_data, missing_details)
-        b64_report = report_text.encode('utf-8')
         st.download_button(
             label="📄 Download Detailed Report",
-            data=b64_report,
+            data=report_text.encode('utf-8'),
             file_name="sync_report.txt",
             mime="text/plain",
-            help="Download the detailed missing translations report (same format as original script)",
+            help="Download the detailed report (position/text/missing breakdown).",
         )
 
-        # Show files with missing translations
+        # Files with missing translations
         missing_mask = df['missing'].apply(lambda x: isinstance(x, int) and x > 0)
         missing_df = df[missing_mask]
         if not missing_df.empty:
@@ -288,8 +376,9 @@ def main():
             for _, row in missing_df.iterrows():
                 with st.expander(f"{row['filename']} — {row['missing']} missing"):
                     st.warning(
-                        f"This file had **{row['missing']}** entries "
-                        "that could not be matched against the translated map."
+                        f"**{row['missing']}** entries had no match "
+                        f"({row['position']} by position, {row['text']} by text). "
+                        "These stay English-only."
                     )
 
     else:
